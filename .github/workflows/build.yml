@@ -1,0 +1,387 @@
+# The client release build. This file lives in the public release repository
+# as .github/workflows/build.yml; the copy in the source repository at
+# tool/release/build.yml is the one to edit (tool/release/README.md).
+#
+# It builds a tag of the private source repository, signs the checksums, and
+# publishes a release here. Nothing from the source but the built programs, the
+# install script, and the third-party notices may leave a job: workflow artifacts of a public repository
+# are public, so they hold only files the release publishes anyway. Artifacts
+# named release-* are the release's files; build-* ones are packaged first.
+name: Build
+
+on:
+  repository_dispatch:
+    types: [release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Source tag to build, such as v2.2.0
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event.client_payload.tag || inputs.tag }}
+  SOURCE_REPOSITORY: eyvant/eyvant
+  # The command name and Go module the source builds (apps/cli/brand.go),
+  # and the prefixes of the released files, which tell the command-line tool
+  # from the apps. The command-line tool ships as one archive per platform,
+  # with the command, agent-crypto where it is built, and their notices.
+  CMD: eyv
+  CLI_FILES: eyvant-cli
+  APP_FILES: eyvant-app
+  CLI_MODULE: github.com/eyvant/eyvant/apps/cli/v2
+  # The Flutter the apps are built with, as on the release machines.
+  FLUTTER_VERSION: 3.47.9
+
+concurrency:
+  group: build-${{ github.event.client_payload.tag || inputs.tag }}
+
+jobs:
+  tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check the tag
+        run: |
+          printf '%s\n' "$TAG" | grep -Eqx 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' ||
+            { echo "not a release tag: $TAG"; exit 1; }
+
+  cli:
+    needs: tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: refs/tags/${{ env.TAG }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: src
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/apps/cli/go.mod
+          cache-dependency-path: src/apps/cli/go.sum
+      - name: Build
+        working-directory: src/apps/cli
+        run: |
+          out=$GITHUB_WORKSPACE/build
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os=${target%/*} arch=${target#*/} ext=
+            [ "$os" = windows ] && ext=.exe
+            CGO_ENABLED=0 GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X $CLI_MODULE.version=$TAG" \
+              -o "$out/$os-$arch/$CMD$ext" ./cmd/$CMD
+          done
+          cp ../../tool/release/install.sh "$out/install.sh"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-cli
+          path: build/
+          if-no-files-found: error
+
+  agent-crypto:
+    needs: tag
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: refs/tags/${{ env.TAG }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          sparse-checkout: apps/agent-crypto
+          path: src
+      # Debian bookworm's glibc (2.36), so the program runs on older
+      # distributions than the runner's.
+      - name: Build
+        run: |
+          docker run --rm -v "$PWD/src/apps/agent-crypto":/src -w /src rust:1.96-bookworm \
+            cargo build --release --locked
+          mkdir -p "build/linux-${{ matrix.arch }}"
+          cp src/apps/agent-crypto/target/release/agent-crypto "build/linux-${{ matrix.arch }}/agent-crypto"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-agent-crypto-${{ matrix.arch }}
+          path: build/
+          if-no-files-found: error
+
+  # The Android app, arm64. The build runs a great deal of third-party code
+  # (Gradle plugins, Dart packages, crate build scripts), so the release key
+  # never reaches it: Gradle signs with a key made for this run, and the
+  # publish job signs the APK again with the release key.
+  android:
+    needs: tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: refs/tags/${{ env.TAG }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: src
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          # Gradle's dependency cache keeps most runs from downloading every
+          # plugin and library again, which Maven Central rate-limits (429).
+          cache: gradle
+          cache-dependency-path: |
+            src/apps/mobile/android/*.gradle*
+            src/apps/mobile/android/app/*.gradle*
+            src/apps/mobile/android/gradle/wrapper/gradle-wrapper.properties
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      # Gradle builds the app's Rust libraries for every Android ABI with the
+      # NDK's compiler: the NDK of FLUTTER_VERSION (FlutterExtension's
+      # ndkVersion), installed before Gradle reads its directory.
+      - name: Install Rust and the NDK
+        run: |
+          rustup toolchain install 1.96 --profile minimal \
+            --target aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+          rustup default 1.96
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358" >/dev/null
+      - name: Build
+        working-directory: src
+        run: |
+          key=$RUNNER_TEMP/run-key.p12
+          export ANDROID_SIGNING_STORE_PASSWORD=$(openssl rand -hex 24)
+          keytool -genkeypair -noprompt -storetype PKCS12 -keystore "$key" \
+            -storepass:env ANDROID_SIGNING_STORE_PASSWORD -alias run -keyalg RSA -keysize 2048 \
+            -validity 1 -dname "CN=$GITHUB_REPOSITORY run $GITHUB_RUN_ID"
+          export ANDROID_SIGNING_STORE_FILE=$key ANDROID_SIGNING_KEY_ALIAS=run
+          # The app's version is the tag's numbers, which version resources
+          # need; Settings shows the whole tag.
+          name=${TAG#v} && name=${name%%-*}
+          export APP_BUILD_VERSION=$TAG
+          python3 apps/mobile/tool/build.py android --build-name "$name"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp apps/mobile/build/dist/*-android-arm64-v8a.apk "$GITHUB_WORKSPACE/dist/$APP_FILES-android-arm64-v8a.apk"
+          rm -f "$key"
+      # Signed only with this run's key until publish signs it: kept a day.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-android
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  # The Windows app's installer, x64, unsigned like local builds: there is
+  # no Windows code-signing certificate, so SmartScreen warns on first run.
+  windows:
+    needs: tag
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: refs/tags/${{ env.TAG }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          path: src
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+      - name: Install Rust and Inno Setup
+        run: |
+          rustup toolchain install 1.96 --profile minimal
+          rustup default 1.96
+          choco install innosetup --no-progress -y
+      - name: Build
+        working-directory: src
+        run: |
+          name=${TAG#v} && name=${name%%-*}
+          export APP_BUILD_VERSION=$TAG
+          python apps/mobile/tool/build.py windows --build-name "$name"
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          cp apps/mobile/build/dist/*-windows-x64-setup.exe "$GITHUB_WORKSPACE/dist/$APP_FILES-windows-x64-setup.exe"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist/
+          if-no-files-found: error
+
+  notices:
+    needs: [tag, android]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: refs/tags/${{ env.TAG }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          sparse-checkout: |
+            apps/cli
+            apps/agent-crypto
+            apps/mobile/native
+            tool/release
+          path: src
+      # The app's Flutter and Dart notices, which the build collected into
+      # the APK.
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-android
+          path: android
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: src/apps/cli/go.mod
+          cache-dependency-path: src/apps/cli/go.sum
+      # The toolchain agent-crypto builds with, and the cargo-about version
+      # tool/release/notices/about.toml is written for.
+      - name: Install cargo-about
+        run: |
+          rustup toolchain install 1.96 --profile minimal
+          rustup default 1.96
+          cargo install --locked cargo-about --version 0.9.3 --features cli
+      - name: Write the notices
+        working-directory: src
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          tool/release/notices.sh "$CMD" "$GITHUB_WORKSPACE/dist/THIRD_PARTY_NOTICES.txt"
+          unzip -p "$GITHUB_WORKSPACE/android/$APP_FILES-android-arm64-v8a.apk" assets/flutter_assets/NOTICES.Z |
+            gunzip >"$RUNNER_TEMP/NOTICES"
+          tool/release/app-notices.sh "$RUNNER_TEMP/NOTICES" "$GITHUB_WORKSPACE/dist/THIRD_PARTY_NOTICES-app.txt"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notices
+          path: dist/
+          if-no-files-found: error
+
+  # One archive of the command-line tool per platform: a directory named as
+  # the archive, holding the command, agent-crypto on Linux, and the notices
+  # that cover both. tar.gz keeps the programs executable; Windows gets a zip.
+  package:
+    needs: [cli, agent-crypto, notices]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: build-*
+          path: build
+          merge-multiple: true
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-notices
+          path: notices
+      - name: Package
+        run: |
+          mkdir -p dist pkg
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
+            os=${target%/*} arch=${target#*/}
+            name=$CLI_FILES-$os-$arch
+            mkdir "pkg/$name"
+            if [ "$os" = windows ]; then
+              install -m 644 "build/$os-$arch/$CMD.exe" "pkg/$name/"
+            else
+              install -m 755 "build/$os-$arch/$CMD" "pkg/$name/"
+            fi
+            [ "$os" != linux ] || install -m 755 "build/$os-$arch/agent-crypto" "pkg/$name/"
+            install -m 644 notices/THIRD_PARTY_NOTICES.txt "pkg/$name/"
+            if [ "$os" = windows ]; then
+              (cd pkg && zip -qr "../dist/$name.zip" "$name")
+            else
+              tar -C pkg --owner=0 --group=0 -czf "dist/$name.tar.gz" "$name"
+            fi
+          done
+          cp build/install.sh dist/
+          ls -l dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-cli
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: [package, android, windows, notices]
+    runs-on: ubuntu-24.04
+    # The signing keys are secrets of this environment, which only
+    # workflows on main can use.
+    environment: release
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: refs/tags/${{ env.TAG }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          sparse-checkout: tool/release
+          path: src
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      # Android updates an app only from a package signed by the same key, so
+      # the APK takes the release key in place of the run's, and must carry
+      # the certificate the source records, as local builds do.
+      - name: Sign the Android app
+        env:
+          ANDROID_SIGNING_KEYSTORE: ${{ secrets.ANDROID_SIGNING_KEYSTORE }}
+          ANDROID_SIGNING_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_STORE_PASSWORD }}
+        run: |
+          keystore=$RUNNER_TEMP/release.p12
+          trap 'rm -f "$keystore"' EXIT
+          (umask 077 && printf '%s' "$ANDROID_SIGNING_KEYSTORE" | base64 -d >"$keystore")
+          tools=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -n 1)
+          want=$(tr -d ': \n' <src/tool/release/android-cert.sha256 | tr 'A-F' 'a-f')
+          echo "apksigner from $tools"
+          for apk in dist/*.apk; do
+            # No v4 signature: it is a separate .idsig file, used only for
+            # incremental adb installs, that would be published beside the APK.
+            "$tools/apksigner" sign --ks "$keystore" --ks-key-alias release \
+              --ks-pass env:ANDROID_SIGNING_STORE_PASSWORD \
+              --v4-signing-enabled false "$apk"
+            # Every signer's certificate, however this apksigner labels the
+            # signer, is the release key's, and there is at least one.
+            verified=$("$tools/apksigner" verify --print-certs "$apk")
+            got=$(printf '%s\n' "$verified" | sed -n 's/.*certificate SHA-256 digest: //p' | sort -u)
+            if [ "$got" != "$want" ]; then
+              echo "$apk: certificate ${got:-none}, want $want"
+              printf '%s\n' "$verified"
+              exit 1
+            fi
+          done
+      - name: Sign
+        env:
+          SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          key=$RUNNER_TEMP/release-key.pem
+          trap 'rm -f "$key" "$RUNNER_TEMP/sig"' EXIT
+          (umask 077 && printf '%s\n' "$SIGNING_KEY" >"$key")
+          cd dist
+          sha256sum -- * >"$RUNNER_TEMP/SHA256SUMS"
+          mv "$RUNNER_TEMP/SHA256SUMS" SHA256SUMS
+          openssl pkeyutl -sign -rawin -inkey "$key" -in SHA256SUMS -out "$RUNNER_TEMP/sig"
+          # Programs verify against the public key the source carries, so a
+          # key that does not match it fails here, not on every machine.
+          openssl pkeyutl -verify -rawin -pubin -inkey ../src/tool/release/release-key.pub \
+            -in SHA256SUMS -sigfile "$RUNNER_TEMP/sig"
+          base64 -w 0 "$RUNNER_TEMP/sig" >SHA256SUMS.sig
+          cat SHA256SUMS
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          commit=$(git -C src rev-parse HEAD)
+          prerelease=
+          case $TAG in *-*) prerelease=--prerelease ;; esac
+          gh release create "$TAG" dist/* --repo "$GITHUB_REPOSITORY" --title "$TAG" $prerelease \
+            --notes "Built from $SOURCE_REPOSITORY $TAG ($commit). SHA256SUMS.sig is the base64 Ed25519 signature of SHA256SUMS."
