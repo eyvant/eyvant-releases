@@ -111,6 +111,12 @@ jobs:
       run:
         shell: bash
     steps:
+      # The Windows Arm image finds Windows' own OpenSSH first, which refuses
+      # the deploy key checkout writes ("bad permissions"); Git's ssh takes it.
+      - name: Use Git's ssh
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content $env:GITHUB_PATH 'C:\Program Files\Git\usr\bin'
       - uses: actions/checkout@v4
         with:
           repository: ${{ env.SOURCE_REPOSITORY }}
