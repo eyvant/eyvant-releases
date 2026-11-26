@@ -4,7 +4,7 @@
 #
 # It builds a tag of the private source repository, signs the checksums, and
 # publishes a release here. Nothing from the source but the built programs, the
-# install script, and the third-party notices may leave a job: workflow artifacts of a public repository
+# install scripts, and the third-party notices may leave a job: workflow artifacts of a public repository
 # are public, so they hold only files the release publishes anyway. Artifacts
 # named release-* are the release's files; build-* ones are packaged first.
 name: Build
@@ -27,7 +27,7 @@ env:
   # The command name and Go module the source builds (apps/cli/brand.go),
   # and the prefixes of the released files, which tell the command-line tool
   # from the apps. The command-line tool ships as one archive per platform,
-  # with the command, agent-crypto where it is built, and their notices.
+  # with the command, agent-crypto, spm, and their notices.
   CMD: eyv
   CLI_FILES: eyvant-cli
   APP_FILES: eyvant-app
@@ -73,23 +73,43 @@ jobs:
               -ldflags "-s -w -X $CLI_MODULE.version=$TAG" \
               -o "$out/$os-$arch/$CMD$ext" ./cmd/$CMD
           done
-          cp ../../tool/release/install.sh "$out/install.sh"
+          cp ../../tool/release/install.sh ../../tool/release/install.ps1 "$out/"
       - uses: actions/upload-artifact@v4
         with:
           name: build-cli
           path: build/
           if-no-files-found: error
 
+  # agent-crypto for every platform the command-line tool ships for, each
+  # on a runner of its own system: Linux in Debian bookworm's container for
+  # its glibc (2.36), so the program runs on older distributions than the
+  # runner's; macOS for 11 and later; Windows with the C runtime linked in,
+  # so it needs no Visual C++ redistributable.
   agent-crypto:
     needs: tag
     strategy:
       matrix:
         include:
           - runner: ubuntu-24.04
-            arch: amd64
+            platform: linux-amd64
           - runner: ubuntu-24.04-arm
-            arch: arm64
+            platform: linux-arm64
+          - runner: macos-15
+            platform: darwin-arm64
+            target: aarch64-apple-darwin
+          - runner: macos-15
+            platform: darwin-amd64
+            target: x86_64-apple-darwin
+          - runner: windows-2025
+            platform: windows-amd64
+            target: x86_64-pc-windows-msvc
+          - runner: windows-11-arm
+            platform: windows-arm64
+            target: aarch64-pc-windows-msvc
     runs-on: ${{ matrix.runner }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
         with:
@@ -99,17 +119,34 @@ jobs:
           persist-credentials: false
           sparse-checkout: apps/agent-crypto
           path: src
-      # Debian bookworm's glibc (2.36), so the program runs on older
-      # distributions than the runner's.
       - name: Build
+        env:
+          TARGET: ${{ matrix.target }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          docker run --rm -v "$PWD/src/apps/agent-crypto":/src -w /src rust:1.96-bookworm \
-            cargo build --release --locked
-          mkdir -p "build/linux-${{ matrix.arch }}"
-          cp src/apps/agent-crypto/target/release/agent-crypto "build/linux-${{ matrix.arch }}/agent-crypto"
+          out=build/$PLATFORM
+          mkdir -p "$out"
+          case $PLATFORM in
+          linux-*)
+            docker run --rm -v "$PWD/src/apps/agent-crypto":/src -w /src rust:1.96-bookworm \
+              cargo build --release --locked
+            cp src/apps/agent-crypto/target/release/agent-crypto "$out/"
+            ;;
+          *)
+            rustup toolchain install 1.96 --profile minimal --target "$TARGET"
+            rustup default 1.96
+            ext=
+            case $PLATFORM in
+            darwin-*) export MACOSX_DEPLOYMENT_TARGET=11.0 ;;
+            windows-*) export RUSTFLAGS="-C target-feature=+crt-static" ext=.exe ;;
+            esac
+            (cd src/apps/agent-crypto && cargo build --release --locked --target "$TARGET")
+            cp "src/apps/agent-crypto/target/$TARGET/release/agent-crypto$ext" "$out/"
+            ;;
+          esac
       - uses: actions/upload-artifact@v4
         with:
-          name: build-agent-crypto-${{ matrix.arch }}
+          name: build-agent-crypto-${{ matrix.platform }}
           path: build/
           if-no-files-found: error
 
@@ -253,7 +290,8 @@ jobs:
         working-directory: src
         run: |
           mkdir -p "$GITHUB_WORKSPACE/dist"
-          tool/release/notices.sh "$CMD" "$GITHUB_WORKSPACE/dist/THIRD_PARTY_NOTICES.txt"
+          tool/release/spm.sh "$RUNNER_TEMP/spm"
+          tool/release/notices.sh "$CMD" "$GITHUB_WORKSPACE/dist/THIRD_PARTY_NOTICES.txt" "$RUNNER_TEMP/spm"
           unzip -p "$GITHUB_WORKSPACE/android/$APP_FILES-android-arm64-v8a.apk" assets/flutter_assets/NOTICES.Z |
             gunzip >"$RUNNER_TEMP/NOTICES"
           tool/release/app-notices.sh "$RUNNER_TEMP/NOTICES" "$GITHUB_WORKSPACE/dist/THIRD_PARTY_NOTICES-app.txt"
@@ -264,12 +302,21 @@ jobs:
           if-no-files-found: error
 
   # One archive of the command-line tool per platform: a directory named as
-  # the archive, holding the command, agent-crypto on Linux, and the notices
-  # that cover both. tar.gz keeps the programs executable; Windows gets a zip.
+  # the archive, holding the command, agent-crypto, the pinned spm (with its
+  # runtimes on macOS and Windows), and the notices that cover them all.
+  # tar.gz keeps the programs executable; Windows gets a zip.
   package:
     needs: [cli, agent-crypto, notices]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPOSITORY }}
+          ref: refs/tags/${{ env.TAG }}
+          ssh-key: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          persist-credentials: false
+          sparse-checkout: tool/release
+          path: src
       - uses: actions/download-artifact@v4
         with:
           pattern: build-*
@@ -281,17 +328,18 @@ jobs:
           path: notices
       - name: Package
         run: |
+          src/tool/release/spm.sh spm
           mkdir -p dist pkg
           for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
             os=${target%/*} arch=${target#*/}
             name=$CLI_FILES-$os-$arch
             mkdir "pkg/$name"
             if [ "$os" = windows ]; then
-              install -m 644 "build/$os-$arch/$CMD.exe" "pkg/$name/"
+              install -m 644 "build/$os-$arch/$CMD.exe" "build/$os-$arch/agent-crypto.exe" "pkg/$name/"
             else
-              install -m 755 "build/$os-$arch/$CMD" "pkg/$name/"
+              install -m 755 "build/$os-$arch/$CMD" "build/$os-$arch/agent-crypto" "pkg/$name/"
             fi
-            [ "$os" != linux ] || install -m 755 "build/$os-$arch/agent-crypto" "pkg/$name/"
+            install -m 755 "spm/$os-$arch"/* "pkg/$name/"
             install -m 644 notices/THIRD_PARTY_NOTICES.txt "pkg/$name/"
             if [ "$os" = windows ]; then
               (cd pkg && zip -qr "../dist/$name.zip" "$name")
@@ -299,7 +347,7 @@ jobs:
               tar -C pkg --owner=0 --group=0 -czf "dist/$name.tar.gz" "$name"
             fi
           done
-          cp build/install.sh dist/
+          cp build/install.sh build/install.ps1 dist/
           ls -l dist
       - uses: actions/upload-artifact@v4
         with:
