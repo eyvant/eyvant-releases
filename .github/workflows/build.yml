@@ -186,13 +186,12 @@ jobs:
         with:
           channel: stable
           flutter-version: ${{ env.FLUTTER_VERSION }}
-      # Gradle builds the app's Rust libraries for every Android ABI with the
-      # NDK's compiler: the NDK of FLUTTER_VERSION (FlutterExtension's
+      # Gradle builds the app's Rust libraries for the APK's ABI (arm64) with
+      # the NDK's compiler: the NDK of FLUTTER_VERSION (FlutterExtension's
       # ndkVersion), installed before Gradle reads its directory.
       - name: Install Rust and the NDK
         run: |
-          rustup toolchain install 1.96 --profile minimal \
-            --target aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android
+          rustup toolchain install 1.96 --profile minimal --target aarch64-linux-android
           rustup default 1.96
           yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "ndk;28.2.13676358" >/dev/null
       - name: Build
