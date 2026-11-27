@@ -9,8 +9,9 @@ Signed builds of the Eyvant apps and command-line tool, built by
 | --- | --- |
 | `eyvant-app-android-arm64-v8a.apk` | The Android app |
 | `eyvant-app-windows-x64-setup.exe` | The Windows app's installer. It is not code-signed, so SmartScreen warns on first run |
-| `eyvant-cli-<os>-<arch>.tar.gz` (`.zip` on Windows) | The command-line tool `eyv` for Linux, macOS, and Windows on amd64 and arm64, with its notices. The Linux archives also hold `agent-crypto`, which agents need for end-to-end encrypted projects |
-| `install.sh` | Installs the command-line tool and pairs the machine as an agent host |
+| `eyvant-cli-<os>-<arch>.tar.gz` (`.zip` on Windows) | The command-line tool `eyv` for Linux, macOS, and Windows on amd64 and arm64, with `agent-crypto`, which agents need for end-to-end encrypted projects, spm, which runs the agent host as a service, and their notices |
+| `install.sh` | Installs the command-line tool on Linux or macOS and pairs the machine as an agent host |
+| `install.ps1` | The same for Windows, in PowerShell |
 | `THIRD_PARTY_NOTICES.txt` | Licenses of what the command-line tool and agent-crypto include |
 | `THIRD_PARTY_NOTICES-app.txt` | Licenses of what the apps include |
 | `SHA256SUMS`, `SHA256SUMS.sig` | Every file's SHA-256, and its signature |
@@ -26,13 +27,32 @@ On a Linux or macOS machine that runs agents:
 curl -fsSL https://app.eyvant.com/install.sh | sh
 ```
 
-It installs `eyv` and, on Linux, `agent-crypto` in `~/.local/bin`, checked
-against `SHA256SUMS`. Elsewhere, download the archive for the system, unpack
-it, and put `eyv` (`eyv.exe` on Windows) on `PATH`, with `agent-crypto`
-beside it on Linux. On macOS, a file downloaded with a browser is quarantined:
-run `xattr -d com.apple.quarantine eyv` before the first run. Earlier releases
-called the command `eyvant`; the install script leaves `eyvant` as a link to
-`eyv`.
+On Windows, in PowerShell:
+
+```powershell
+irm https://app.eyvant.com/install.ps1 | iex
+```
+
+Each downloads the archive for the machine, checks it against `SHA256SUMS`,
+installs `eyv`, `agent-crypto`, and spm, and pairs the machine as an agent
+host: it shows a pairing code, a QR code, and a fingerprint to confirm in the
+app. `install.sh` installs in `~/.local/bin`; `install.ps1` in
+`%LOCALAPPDATA%\Programs\eyvant`, which it adds to the user's `PATH`. To name
+the machine, run `curl -fsSL https://app.eyvant.com/install.sh | sh -s -- -name build-01`,
+or on Windows:
+
+```powershell
+& ([scriptblock]::Create((irm https://app.eyvant.com/install.ps1))) -name build-01
+```
+
+Running the command again on a paired machine updates it to the latest
+release. Earlier releases called the command `eyvant`; `install.sh` leaves
+`eyvant` as a link to `eyv`.
+
+To install by hand instead, download the archive for the system, unpack it,
+and put `eyv` (`eyv.exe` on Windows) on `PATH`, with `agent-crypto` beside it.
+On macOS, a file downloaded with a browser is quarantined: run
+`xattr -d com.apple.quarantine eyv agent-crypto` before the first run.
 
 ## Checking a download
 
